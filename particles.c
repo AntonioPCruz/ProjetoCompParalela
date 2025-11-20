@@ -933,6 +933,7 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
     double energy = 0;
 
     // Advance particles
+    #pragma omp parallel for schedule(static) reduction(+:energy)
     for (int i=0; i<spec->np; i++) {
 
         float3 Ep, Bp;
@@ -1023,10 +1024,11 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
         // 				 qnx, qvy, qvz,
         // 				 current );
 
-        dep_current_zamb( spec -> part[i].ix, di,
-                         spec -> part[i].x, dx,
-                         qnx, qvy, qvz,
-                         current );
+        // TODO: Enable after thread-private J buffers are added
+        // dep_current_zamb( spec->part[i].ix, di,
+        //                   spec->part[i].x, dx,
+        //                   qnx, qvy, qvz,
+        //                   current );
 
         // Store results
         spec -> part[i].x = x1;
