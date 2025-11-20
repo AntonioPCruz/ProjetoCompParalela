@@ -1,8 +1,8 @@
 # GCC options
 CC = gcc
-CFLAGS = -Ofast -g -std=c99 -pedantic -Wall
+CFLAGS = -Ofast -g -std=c99 -pedantic -Wall -fopenmp
+LDFLAGS = -lm -fopenmp
 #CFLAGS = -Kfast -std=c99 
-LDFLAGS = -lm
 
 #Debug options
 #CFLAGS = -g -Og -std=c99 -pedantic -fsanitize=undefined -fsanitize=address
