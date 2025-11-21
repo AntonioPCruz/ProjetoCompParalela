@@ -919,15 +919,6 @@ int ltrim( float x )
  */
 void spec_advance( t_species* spec, t_emf* emf, t_current* current )
 {
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        int nthreads = omp_get_num_threads();
-        #pragma omp master
-        printf("OpenMP enabled: nthreads=%d\n", nthreads);
-        // Print only thread 0 to avoid floods, or print tid for debugging.
-    }
-
     uint64_t t0;
     t0 = timer_ticks();
 
