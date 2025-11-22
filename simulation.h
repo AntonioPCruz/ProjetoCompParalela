@@ -59,6 +59,16 @@ void sim_report( t_simulation* sim );
 void sim_iter( t_simulation* sim );
 
 /**
+ * @brief Advance simulation 1 iteration (for use inside parallel region)
+ * 
+ * This version assumes it is called from within an OpenMP parallel region.
+ * Serial tasks are performed with #pragma omp single.
+ * 
+ * @param sim 	EM1D Simulation
+ */
+void sim_iter_parallel( t_simulation* sim );
+
+/**
  * @brief Print report on simulation energy (fields/particles/total)
  * 
  * @param sim 	EM1D Simulation

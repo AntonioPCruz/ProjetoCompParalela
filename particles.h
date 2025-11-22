@@ -194,6 +194,11 @@ void spec_grow_buffer( t_species* spec, const int size );
 void spec_advance( t_species* spec, t_emf* emf, t_current* current );
 
 /**
+ * @brief Free persistent thread-local buffers (call at program exit)
+ */
+void spec_cleanup_thread_local_buffers( void );
+
+/**
  * @brief Returns the total time spent pushing particles (includes boundaries and moving window)
  * @return  Total time in seconds
  */

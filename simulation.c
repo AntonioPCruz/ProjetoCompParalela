@@ -56,6 +56,31 @@ void sim_iter( t_simulation* sim ) {
 }
 
 /**
+ * @brief Advance simulation 1 iteration (for use inside parallel region)
+ * 
+ * This version assumes it is called from within an OpenMP parallel region.
+ * Serial tasks are performed with #pragma omp single.
+ * 
+ * @param sim 	EM1D Simulation
+ */
+void sim_iter_parallel( t_simulation* sim ) {
+	// Serial: zero current density
+	#pragma omp single
+	current_zero( &sim -> current );
+
+	// Parallel: advance particles and deposit current
+	for (int i = 0; i<sim -> n_species; i++)
+		spec_advance(&sim -> species[i], &sim -> emf, &sim -> current );
+
+	// Serial: update current boundary and advance EM fields
+	#pragma omp single
+	{
+		current_update( &sim -> current );
+		emf_advance( &sim -> emf, &sim -> current );
+	}
+}
+
+/**
  * @brief Prints out report on simulation timings
  * 
  * @param sim 	EM1D Simulaiton

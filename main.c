@@ -83,6 +83,9 @@ int main (int argc, const char * argv[]) {
 	// Simulation times
     sim_timings( &sim, t0, t1 );
 
+    // Cleanup thread-local buffers
+    spec_cleanup_thread_local_buffers();
+
     // Cleanup data
     sim_delete( &sim );
     
