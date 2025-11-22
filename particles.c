@@ -27,6 +27,15 @@
 static double _spec_time = 0.0;
 static uint64_t _spec_npush = 0;
 
+/**
+ * @brief Structure for thread-local current accumulation
+ */
+typedef struct {
+    float x;
+    float y;
+    float z;
+} jcell_local_t;
+
 void spec_sort( t_species *spec );
 void spec_move_window( t_species *spec );
 
@@ -632,6 +641,155 @@ void spec_delete( t_species* spec )
  *********************************************************************************************/
 
 /**
+ * @brief Deposit single particle current using Esirkepov method (thread-local version)
+ * 
+ * @param ix0       Initial cell index of particle
+ * @param di        Number of cells moved {-1,0,1}
+ * @param x0        Initial position of particle inside cell
+ * @param x1        Final position of particle inside cell
+ * @param qnx       Normalization for x current (q * cell size / dt)
+ * @param qvy       Y current ( q * vy )
+ * @param qvz       Z current ( q * vz )
+ * @param J_local   Thread-local current buffer
+ * @param ncell     Number of cells
+ */
+void dep_current_esk_local( int ix0, int di,
+                        float x0, float x1,
+                        float qnx, float qvy, float qvz,
+                        jcell_local_t *J_local, int ncell )
+{
+
+    float S0x[4], S1x[4], DSx[4];
+    float Wx[4], Wy[4], Wz[4];
+
+    S0x[0] = 0.0f;
+    S0x[1] = 1.0f - x0;
+    S0x[2] = x0;
+    S0x[3] = 0.0f;
+
+    for (int i=0; i<4; i++) {
+        S1x[i] = 0.0f;
+    }
+
+    S1x[ 1 + di ] = 1.0f - x1;
+    S1x[ 2 + di ] = x1;
+
+    for (int i=0; i<4; i++) {
+        DSx[i] = S1x[i] - S0x[i];
+    }
+
+    for (int i=0; i<4; i++) {
+        Wx[i] = qnx * DSx[i];
+        Wy[i] = qvy * (S0x[i] + DSx[i]/2.0f);
+        Wz[i] = qvz * (S0x[i] + DSx[i]/2.0f);
+    }
+
+    jcell_local_t* restrict J = J_local;
+    // jx
+    float c;
+
+    c = - Wx[0];
+    J[ ix0 - 1 ].x += c;
+    for (int i=1; i<4; i++) {
+        c -=  Wx[i];
+        J[ ix0 + i ].x += c;
+    }
+
+    // jy, jz
+    for (int i=0; i<4; i++) {
+        J[ ix0 + i - 1 ].y += Wy[ i ];
+        J[ ix0 + i - 1 ].z += Wz[ i ];
+    }
+
+}
+
+/**
+ * @brief Deposit single particle current using zamb method (thread-local version)
+ * 
+ * @param ix0       Initial cell index of particle
+ * @param di        Number of cells moved {-1,0,1}
+ * @param x0        Initial position of particle inside cell
+ * @param dx        Particle motion normalized to cell size
+ * @param qnx       Normalization for x current (q * cell size / dt)
+ * @param qvy       Y current ( q * vy )
+ * @param qvz       Z current ( q * vz )
+ * @param J_local   Thread-local current buffer
+ * @param ncell     Number of cells
+ */
+void dep_current_zamb_local( int ix0, int di,
+                        float x0, float dx,
+                        float qnx, float qvy, float qvz,
+                        jcell_local_t *J_local, int ncell )
+{
+    // Split the particle trajectory
+    typedef struct {
+        float x0, x1, dx, qvy, qvz;
+        int ix;
+    } t_vp;
+
+    t_vp vp[3];
+    int vnp = 1;
+
+    // split
+    vp[0].x0 = x0;
+    vp[0].dx = dx;
+
+    vp[0].x1 = x0+dx;
+
+    vp[0].qvy = qvy/2.0;
+    vp[0].qvz = qvz/2.0;
+
+    vp[0].ix = ix0;
+
+    // x split
+    if ( di != 0 ) {
+
+        int ib = ( di == 1 );
+
+        float delta = (x0+dx-ib)/dx;
+
+        // Add new particle
+        vp[1].x0 = 1-ib;
+        vp[1].x1 = (x0 + dx) - di;
+        vp[1].dx = dx*delta;
+        vp[1].ix = ix0 + di;
+
+        vp[1].qvy = vp[0].qvy*delta;
+        vp[1].qvz = vp[0].qvz*delta;
+
+        // Correct previous particle
+        vp[0].x1 = ib;
+        vp[0].dx *= (1.0f-delta);
+
+        vp[0].qvy *= (1.0f-delta);
+        vp[0].qvz *= (1.0f-delta);
+
+        vnp++;
+
+    }
+
+    // Deposit virtual particle currents
+    jcell_local_t* restrict J = J_local;
+
+    for (int k = 0; k < vnp; k++) {
+        float S0x[2], S1x[2];
+
+        S0x[0] = 1.0f - vp[k].x0;
+        S0x[1] = vp[k].x0;
+
+        S1x[0] = 1.0f - vp[k].x1;
+        S1x[1] = vp[k].x1;
+
+        J[ vp[k].ix     ].x += qnx * vp[k].dx;
+        J[ vp[k].ix     ].y += vp[k].qvy * (S0x[0]+S1x[0]+(S0x[0]-S1x[0])/2.0f);
+        J[ vp[k].ix + 1 ].y += vp[k].qvy * (S0x[1]+S1x[1]+(S0x[1]-S1x[1])/2.0f);
+        J[ vp[k].ix     ].z += vp[k].qvz * (S0x[0]+S1x[0]+(S0x[0]-S1x[0])/2.0f);
+        J[ vp[k].ix  +1 ].z += vp[k].qvz * (S0x[1]+S1x[1]+(S0x[1]-S1x[1])/2.0f);
+    }
+
+}
+
+/**
  * @brief Deposit single particle current using Esirkepov method
  * 
  * @param ix0       Initial cell index of particle
@@ -929,8 +1087,25 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
     const float qnx = spec -> q *  spec->dx / spec->dt;
 
     const int nx0 = spec -> nx;
+    const int ncell = current -> nx;
+    const int gc0 = current -> gc[0];
+    const int gc1 = current -> gc[1];
+    const int ncell_total = gc0 + ncell + gc1;
 
     double energy = 0;
+
+    // Allocate thread-local current buffers
+    int nthreads = 1;
+    #pragma omp parallel
+    {
+        #pragma omp master
+        {
+            nthreads = omp_get_num_threads();
+        }
+    }
+
+    jcell_local_t *J_local_buf = (jcell_local_t *) malloc( nthreads * ncell_total * sizeof(jcell_local_t) );
+    memset( J_local_buf, 0, nthreads * ncell_total * sizeof(jcell_local_t) );
 
     // Advance particles
     #pragma omp parallel for schedule(static) reduction(+:energy)
@@ -1018,23 +1193,39 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
         float qvy = spec->q * uy * rg;
         float qvz = spec->q * uz * rg;
 
-        // deposit current using Eskirepov method
-        // dep_current_esk( spec -> part[i].ix, di,
-        // 				 spec -> part[i].x, x1,
-        // 				 qnx, qvy, qvz,
-        // 				 current );
+        // deposit current using Zamb method with thread-local buffers
+        int tid = omp_get_thread_num();
+        jcell_local_t *Jl = J_local_buf + tid * ncell_total + gc0;
 
-        // TODO: Enable after thread-private J buffers are added
-        // dep_current_zamb( spec->part[i].ix, di,
-        //                   spec->part[i].x, dx,
-        //                   qnx, qvy, qvz,
-        //                   current );
+        dep_current_zamb_local( spec->part[i].ix, di,
+                              spec->part[i].x, dx,
+                              qnx, qvy, qvz,
+                              Jl, ncell_total );
 
         // Store results
         spec -> part[i].x = x1;
         spec -> part[i].ix += di;
 
     }
+
+    // Merge thread-local current buffers into global current
+    float3* restrict const J = current -> J;
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < ncell; c++) {
+        float jx = 0.0f, jy = 0.0f, jz = 0.0f;
+        for (int t = 0; t < nthreads; t++) {
+            jcell_local_t *Jl = J_local_buf + t * ncell_total + gc0;
+            jx += Jl[c].x;
+            jy += Jl[c].y;
+            jz += Jl[c].z;
+        }
+        J[c].x = jx;
+        J[c].y = jy;
+        J[c].z = jz;
+    }
+
+    // Free thread-local buffer
+    free(J_local_buf);
 
     // Store energy
     spec -> energy = spec-> q * spec -> m_q * energy * spec -> dx;
