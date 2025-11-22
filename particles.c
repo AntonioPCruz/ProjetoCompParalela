@@ -16,6 +16,11 @@
 #include <stdio.h>
 #include <omp.h>
 
+/* Sometimes posix_memalign isn't declared depending on feature macros; provide a prototype as a fallback */
+#ifndef HAVE_POSIX_MEMALIGN_PROTOTYPE
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+#endif
+
 #include "particles.h"
 
 #include "random.h"
@@ -1180,6 +1185,7 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
             memset( _J_local_buf + tid * _ncell_total, 0, _ncell_total * sizeof(jcell_local_t) );
 
             // Advance particles with guided scheduling for load balancing
+            double local_energy = 0.0;
             #pragma omp for schedule(guided)
             for (int i=0; i<spec->np; i++) {
 
@@ -1216,8 +1222,8 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
                 u2 = utx*utx + uty*uty + utz*utz;
                 gamma = sqrtf( 1 + u2 );
 
-                // Accumulate time centered energy
-                energy += u2 / ( 1 + gamma );
+                // Accumulate time centered energy into thread-local accumulator
+                local_energy += u2 / ( 1 + gamma );
 
                 gtem = tem / gamma;
 
@@ -1295,6 +1301,10 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
             // Store per-thread min/max in cache-line-aligned array
             _minmax[tid].min = local_min;
             _minmax[tid].max = local_max;
+
+            // Add thread-local energy into shared energy with atomic update
+            #pragma omp atomic
+            energy += local_energy;
 
             // Merge thread-local current buffers into global current (only over active range)
             #pragma omp single
