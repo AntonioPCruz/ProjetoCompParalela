@@ -1224,6 +1224,15 @@ static void spec_advance_worker( t_species* spec, t_emf* emf, t_current* current
     int local_max = -1;
 
     // Reset thread-local buffer for this timestep
+    if (_J_local_buf == NULL) {
+        fprintf(stderr, "FATAL: _J_local_buf is NULL (thread %d)\n", tid);
+        abort();
+    }
+    if (tid < 0 || tid >= _nthreads) {
+        fprintf(stderr, "FATAL: thread id %d out of range (nthreads=%d)\n", tid, _nthreads);
+        abort();
+    }
+
     memset( _J_local_buf + tid * _ncell_total, 0, _ncell_total * sizeof(jcell_local_t) );
 
     // Advance particles with guided scheduling for load balancing
@@ -1329,6 +1338,23 @@ static void spec_advance_worker( t_species* spec, t_emf* emf, t_current* current
             if (dep_cells[j] > local_max) local_max = dep_cells[j];
         }
 
+        /*
+         * Sanity check: ensure deposit indices will not write out of the
+         * allocated _J_local_buf. Compute absolute index into the buffer and
+         * validate bounds. This check helps catch mismatches in _nthreads or
+         * _ncell_total sizing that would otherwise corrupt the heap.
+         */
+        for (int j = 0; j < 4; j++) {
+            long dep = dep_cells[j];
+            size_t abs_idx = (size_t)tid * (size_t)_ncell_total + (size_t)_gc0 + (size_t)dep;
+            size_t total_elems = (size_t)_nthreads * (size_t)_ncell_total;
+            if (dep < -_gc0 || abs_idx >= total_elems) {
+                fprintf(stderr, "FATAL: OOB deposit detected: tid=%d dep=%ld abs_idx=%zu total=%zu gc0=%d ncell_total=%d nthreads=%d\n",
+                        tid, dep, abs_idx, total_elems, _gc0, _ncell_total, _nthreads);
+                abort();
+            }
+        }
+
         dep_current_zamb_local( spec->part[i].ix, di,
                               spec->part[i].x, dx,
                               qnx, qvy, qvz,
@@ -1378,6 +1404,14 @@ static void spec_advance_worker( t_species* spec, t_emf* emf, t_current* current
         float jx = 0.0f, jy = 0.0f, jz = 0.0f;
         for (int t = 0; t < _nthreads; t++) {
             jcell_local_t *Jl = _J_local_buf + t * _ncell_total + _gc0;
+            /* bounds check for merge access */
+            size_t abs_idx = (size_t)t * (size_t)_ncell_total + (size_t)_gc0 + (size_t)c;
+            size_t total_elems = (size_t)_nthreads * (size_t)_ncell_total;
+            if (c < 0 || abs_idx >= total_elems) {
+                fprintf(stderr, "FATAL: OOB merge access: t=%d c=%d abs_idx=%zu total=%zu gc0=%d ncell_total=%d nthreads=%d merge_lo=%d merge_hi=%d\n",
+                        t, c, abs_idx, total_elems, _gc0, _ncell_total, _nthreads, merge_lo, merge_hi);
+                abort();
+            }
             jx += Jl[c].x;
             jy += Jl[c].y;
             jz += Jl[c].z;
