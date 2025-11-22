@@ -1116,38 +1116,75 @@ static void _spec_init_thread_local_buffers( t_current* current )
     int gc1 = current->gc[1];
     int ncell_total = gc0 + ncell + gc1;
 
-    // Determine number of threads
-    #pragma omp parallel
-    {
+    /*
+     * Determine number of threads. If called from inside a parallel region
+     * we must use the existing team size (omp_get_num_threads()). If called
+     * outside, use omp_get_max_threads() to size buffers for the expected
+     * team that will be created later.
+     */
+    if ( omp_in_parallel() ) {
+        /* Called from inside a parallel region: use the current team size and
+         * perform allocation/initialization coordinated by the master thread
+         * so we don't spawn nested teams. */
+        _nthreads = omp_get_num_threads();
+        _ncell_total = ncell_total;
+        _gc0 = gc0;
+
+        /* Allocate buffers once by master thread inside the existing team */
         #pragma omp master
         {
-            _nthreads = omp_get_num_threads();
+            int ret = posix_memalign((void**)&_J_local_buf, 64, _nthreads * ncell_total * sizeof(jcell_local_t));
+            if (ret != 0) {
+                fprintf(stderr, "ERROR: posix_memalign failed for _J_local_buf\n");
+                exit(1);
+            }
+
+            _minmax = (minmax_t *) malloc( _nthreads * sizeof(minmax_t) );
+            if (_minmax == NULL) {
+                fprintf(stderr, "ERROR: malloc failed for _minmax\n");
+                exit(1);
+            }
         }
-    }
+        /* Ensure allocation completed before touching memory */
+        #pragma omp barrier
 
-    _ncell_total = ncell_total;
-    _gc0 = gc0;
+        /* First-touch initialization using the existing team */
+        #pragma omp for
+        for (int tid = 0; tid < _nthreads; tid++) {
+            memset( _J_local_buf + tid * ncell_total, 0, ncell_total * sizeof(jcell_local_t) );
+            _minmax[tid].min = ncell;
+            _minmax[tid].max = -1;
+        }
 
-    // Allocate persistent buffers with 64-byte alignment
-    int ret = posix_memalign((void**)&_J_local_buf, 64, _nthreads * ncell_total * sizeof(jcell_local_t));
-    if (ret != 0) {
-        fprintf(stderr, "ERROR: posix_memalign failed for _J_local_buf\n");
-        exit(1);
-    }
+        /* Ensure initialization complete */
+        #pragma omp barrier
 
-    _minmax = (minmax_t *) malloc( _nthreads * sizeof(minmax_t) );
-    if (_minmax == NULL) {
-        fprintf(stderr, "ERROR: malloc failed for _minmax\n");
-        exit(1);
-    }
+    } else {
+        /* Called from outside any parallel region: size buffers for default team */
+        _nthreads = omp_get_max_threads();
+        _ncell_total = ncell_total;
+        _gc0 = gc0;
 
-    // First-touch initialization with proper NUMA placement
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        memset( _J_local_buf + tid * ncell_total, 0, ncell_total * sizeof(jcell_local_t) );
-        _minmax[tid].min = ncell;
-        _minmax[tid].max = -1;
+        int ret = posix_memalign((void**)&_J_local_buf, 64, _nthreads * ncell_total * sizeof(jcell_local_t));
+        if (ret != 0) {
+            fprintf(stderr, "ERROR: posix_memalign failed for _J_local_buf\n");
+            exit(1);
+        }
+
+        _minmax = (minmax_t *) malloc( _nthreads * sizeof(minmax_t) );
+        if (_minmax == NULL) {
+            fprintf(stderr, "ERROR: malloc failed for _minmax\n");
+            exit(1);
+        }
+
+        /* First-touch initialization with proper NUMA placement */
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            memset( _J_local_buf + tid * ncell_total, 0, ncell_total * sizeof(jcell_local_t) );
+            _minmax[tid].min = ncell;
+            _minmax[tid].max = -1;
+        }
     }
 }
 
