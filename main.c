@@ -56,17 +56,28 @@ int main (int argc, const char * argv[]) {
 	t0 = timer_ticks();
     printf("n = 0, t = 0.0\n");
 
-	for (n=0,t=0.0; t<=sim.tmax; n++, t=n*sim.dt) {
-        //printf("n = %i, t = %f\n",n,t);
+	// Create persistent parallel team spanning all timesteps to eliminate fork/join overhead
+	#pragma omp parallel
+	{
+		for (n=0,t=0.0; t<=sim.tmax; n++, t=n*sim.dt) {
+			// Serial I/O and diagnostics (only one thread executes)
+			#pragma omp single
+			{
+				if ( report ( n , sim.ndump ) )	sim_report( &sim );
+			}
 
-		if ( report ( n , sim.ndump ) )	sim_report( &sim );
+			// Parallel particle advance inside persistent team (no new team creation)
+			sim_iter_parallel( &sim );
 
-		sim_iter( &sim );
-
-        if (n==0){
-            sim_report_energy_ret( &sim, &en_in);
-            sim_report_energy (&sim);
-        }
+			// Serial energy reporting (only one thread executes)
+			#pragma omp single
+			{
+				if (n==0){
+					sim_report_energy_ret( &sim, &en_in);
+					sim_report_energy (&sim);
+				}
+			}
+		}
 	}
     printf("n = %i, t = %f\n",n,t);
 

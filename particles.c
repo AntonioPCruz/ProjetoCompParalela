@@ -1151,6 +1151,206 @@ static void _spec_init_thread_local_buffers( t_current* current )
     }
 }
 
+/**
+ * spec_advance_worker()
+ * Core particle push and merge logic executed inside a parallel region
+ * Assumes it is called from within #pragma omp parallel (implicit or explicit)
+ * 
+ * This function:
+ * - Advances particles using Boris scheme
+ * - Deposits current to thread-local buffers
+ * - Accumulates thread-local energy
+ * - Computes per-thread min/max deposited cells
+ * - Merges thread-local buffers into global current (optimized over active range)
+ * 
+ * This function DOES NOT create a parallel region, allowing it to be called:
+ * 1. From within spec_advance's legacy outer path (with #pragma omp parallel wrapper)
+ * 2. From within spec_advance's new persistent-team path (no wrapper needed)
+ * 3. From main.c's persistent team loop
+ * 
+ * Parameters:
+ *  spec:     Particle species
+ *  emf:      Electromagnetic fields
+ *  current:  Current grid
+ *  energy:   Pointer to shared energy accumulator (updated with atomic)
+ *  tem:      Particle energy scaling factor
+ *  dt_dx:    Time step / cell width
+ *  qnx:      Charge * cell division
+ *  ncell:    Grid size
+ */
+static void spec_advance_worker( t_species* spec, t_emf* emf, t_current* current,
+                                  double* energy, 
+                                  float tem, float dt_dx, float qnx, int ncell )
+{
+    int tid = omp_get_thread_num();
+    int local_min = ncell;
+    int local_max = -1;
+
+    // Reset thread-local buffer for this timestep
+    memset( _J_local_buf + tid * _ncell_total, 0, _ncell_total * sizeof(jcell_local_t) );
+
+    // Advance particles with guided scheduling for load balancing
+    double local_energy = 0.0;
+    #pragma omp for schedule(guided)
+    for (int i=0; i<spec->np; i++) {
+
+        float3 Ep, Bp;
+        float utx, uty, utz;
+        float ux, uy, uz, u2;
+        float gamma, rg, gtem, otsq;
+
+        float x1;
+
+        int di;
+        float dx;
+
+        // Load particle momenta
+        ux = spec -> part[i].ux;
+        uy = spec -> part[i].uy;
+        uz = spec -> part[i].uz;
+
+        // interpolate fields
+        interpolate_fld( emf -> E_part, emf -> B_part, &spec -> part[i], &Ep, &Bp );
+        // Ep.x = Ep.y = Ep.z = Bp.x = Bp.y = Bp.z = 0;
+
+        // advance u using Boris scheme
+        Ep.x *= tem;
+        Ep.y *= tem;
+        Ep.z *= tem;
+
+        utx = ux + Ep.x;
+        uty = uy + Ep.y;
+        utz = uz + Ep.z;
+
+        // Perform first half of the rotation
+        // Get time centered gamma
+        u2 = utx*utx + uty*uty + utz*utz;
+        gamma = sqrtf( 1 + u2 );
+
+        // Accumulate time centered energy into thread-local accumulator
+        local_energy += u2 / ( 1 + gamma );
+
+        gtem = tem / gamma;
+
+        Bp.x *= gtem;
+        Bp.y *= gtem;
+        Bp.z *= gtem;
+
+        otsq = 2.0f / ( 1.0f + Bp.x*Bp.x + Bp.y*Bp.y + Bp.z*Bp.z );
+
+        ux = utx + uty*Bp.z - utz*Bp.y;
+        uy = uty + utz*Bp.x - utx*Bp.z;
+        uz = utz + utx*Bp.y - uty*Bp.x;
+
+        // Perform second half of the rotation
+
+        Bp.x *= otsq;
+        Bp.y *= otsq;
+        Bp.z *= otsq;
+
+        utx += uy*Bp.z - uz*Bp.y;
+        uty += uz*Bp.x - ux*Bp.z;
+        utz += ux*Bp.y - uy*Bp.x;
+
+        // Perform second half of electric field acceleration
+        ux = utx + Ep.x;
+        uy = uty + Ep.y;
+        uz = utz + Ep.z;
+
+        // Store new momenta
+        spec -> part[i].ux = ux;
+        spec -> part[i].uy = uy;
+        spec -> part[i].uz = uz;
+
+        // push particle
+        rg = 1.0f / sqrtf(1.0f + ux*ux + uy*uy + uz*uz);
+
+        dx = dt_dx * rg * ux;
+
+        x1 = spec -> part[i].x + dx;
+
+        di = ltrim(x1);
+
+        x1 -= di;
+
+        float qvy = spec->q * uy * rg;
+        float qvz = spec->q * uz * rg;
+
+        // deposit current using Zamb method with thread-local buffers
+        tid = omp_get_thread_num();
+        jcell_local_t *Jl = _J_local_buf + tid * _ncell_total + _gc0;
+
+        // Track min/max deposited cells for optimized merge
+        int dep_cells[4];
+        dep_cells[0] = spec->part[i].ix - 1;
+        dep_cells[1] = spec->part[i].ix;
+        dep_cells[2] = spec->part[i].ix + di;
+        dep_cells[3] = spec->part[i].ix + di + 1;
+
+        for (int j = 0; j < 4; j++) {
+            if (dep_cells[j] < local_min) local_min = dep_cells[j];
+            if (dep_cells[j] > local_max) local_max = dep_cells[j];
+        }
+
+        dep_current_zamb_local( spec->part[i].ix, di,
+                              spec->part[i].x, dx,
+                              qnx, qvy, qvz,
+                              Jl, _ncell_total );
+
+        // Store results
+        spec -> part[i].x = x1;
+        spec -> part[i].ix += di;
+
+    }
+
+    // Store per-thread min/max in cache-line-aligned array
+    _minmax[tid].min = local_min;
+    _minmax[tid].max = local_max;
+
+    // Add thread-local energy into shared energy with atomic update
+    #pragma omp atomic
+    *energy += local_energy;
+
+    // Merge thread-local current buffers into global current (only over active range)
+    #pragma omp single
+    {
+        int merge_lo = ncell;
+        int merge_hi = -1;
+        for (int t = 0; t < _nthreads; t++) {
+            if (_minmax[t].min < merge_lo) merge_lo = _minmax[t].min;
+            if (_minmax[t].max > merge_hi) merge_hi = _minmax[t].max;
+        }
+        // Clamp to valid range
+        if (merge_lo < 0) merge_lo = 0;
+        if (merge_hi >= ncell) merge_hi = ncell - 1;
+        
+        // Store in shared variables for all threads to read
+        _merge_lo = merge_lo;
+        _merge_hi = merge_hi;
+    }
+
+    // Implicit barrier ensures all threads see the updated _merge_lo and _merge_hi
+    
+    int merge_lo = _merge_lo;
+    int merge_hi = _merge_hi;
+
+    float3* restrict const J = current -> J;
+    
+    #pragma omp for schedule(static)
+    for (int c = merge_lo; c <= merge_hi; c++) {
+        float jx = 0.0f, jy = 0.0f, jz = 0.0f;
+        for (int t = 0; t < _nthreads; t++) {
+            jcell_local_t *Jl = _J_local_buf + t * _ncell_total + _gc0;
+            jx += Jl[c].x;
+            jy += Jl[c].y;
+            jz += Jl[c].z;
+        }
+        J[c].x = jx;
+        J[c].y = jy;
+        J[c].z = jz;
+    }
+}
+
 void spec_advance( t_species* spec, t_emf* emf, t_current* current )
 {
     uint64_t t0;
@@ -1170,346 +1370,16 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
 
     double energy = 0;
 
-    // Advance particles and merge current in a single parallel region
-    float3* restrict const J = current -> J;
-    
     // Check if already in parallel region; if not, create one
     if (!omp_in_parallel()) {
+        // Not in a parallel region - create team and execute worker
         #pragma omp parallel reduction(+:energy)
         {
-            int tid = omp_get_thread_num();
-            int local_min = ncell;
-            int local_max = -1;
-
-            // Reset thread-local buffer for this timestep
-            memset( _J_local_buf + tid * _ncell_total, 0, _ncell_total * sizeof(jcell_local_t) );
-
-            // Advance particles with guided scheduling for load balancing
-            double local_energy = 0.0;
-            #pragma omp for schedule(guided)
-            for (int i=0; i<spec->np; i++) {
-
-                float3 Ep, Bp;
-                float utx, uty, utz;
-                float ux, uy, uz, u2;
-                float gamma, rg, gtem, otsq;
-
-                float x1;
-
-                int di;
-                float dx;
-
-                // Load particle momenta
-                ux = spec -> part[i].ux;
-                uy = spec -> part[i].uy;
-                uz = spec -> part[i].uz;
-
-                // interpolate fields
-                interpolate_fld( emf -> E_part, emf -> B_part, &spec -> part[i], &Ep, &Bp );
-                // Ep.x = Ep.y = Ep.z = Bp.x = Bp.y = Bp.z = 0;
-
-                // advance u using Boris scheme
-                Ep.x *= tem;
-                Ep.y *= tem;
-                Ep.z *= tem;
-
-                utx = ux + Ep.x;
-                uty = uy + Ep.y;
-                utz = uz + Ep.z;
-
-                // Perform first half of the rotation
-                // Get time centered gamma
-                u2 = utx*utx + uty*uty + utz*utz;
-                gamma = sqrtf( 1 + u2 );
-
-                // Accumulate time centered energy into thread-local accumulator
-                local_energy += u2 / ( 1 + gamma );
-
-                gtem = tem / gamma;
-
-                Bp.x *= gtem;
-                Bp.y *= gtem;
-                Bp.z *= gtem;
-
-                otsq = 2.0f / ( 1.0f + Bp.x*Bp.x + Bp.y*Bp.y + Bp.z*Bp.z );
-
-                ux = utx + uty*Bp.z - utz*Bp.y;
-                uy = uty + utz*Bp.x - utx*Bp.z;
-                uz = utz + utx*Bp.y - uty*Bp.x;
-
-                // Perform second half of the rotation
-
-                Bp.x *= otsq;
-                Bp.y *= otsq;
-                Bp.z *= otsq;
-
-                utx += uy*Bp.z - uz*Bp.y;
-                uty += uz*Bp.x - ux*Bp.z;
-                utz += ux*Bp.y - uy*Bp.x;
-
-                // Perform second half of electric field acceleration
-                ux = utx + Ep.x;
-                uy = uty + Ep.y;
-                uz = utz + Ep.z;
-
-                // Store new momenta
-                spec -> part[i].ux = ux;
-                spec -> part[i].uy = uy;
-                spec -> part[i].uz = uz;
-
-                // push particle
-                rg = 1.0f / sqrtf(1.0f + ux*ux + uy*uy + uz*uz);
-
-                dx = dt_dx * rg * ux;
-
-                x1 = spec -> part[i].x + dx;
-
-                di = ltrim(x1);
-
-                x1 -= di;
-
-                float qvy = spec->q * uy * rg;
-                float qvz = spec->q * uz * rg;
-
-                // deposit current using Zamb method with thread-local buffers
-                tid = omp_get_thread_num();
-                jcell_local_t *Jl = _J_local_buf + tid * _ncell_total + _gc0;
-
-                // Track min/max deposited cells for optimized merge
-                int dep_cells[4];
-                dep_cells[0] = spec->part[i].ix - 1;
-                dep_cells[1] = spec->part[i].ix;
-                dep_cells[2] = spec->part[i].ix + di;
-                dep_cells[3] = spec->part[i].ix + di + 1;
-
-                for (int j = 0; j < 4; j++) {
-                    if (dep_cells[j] < local_min) local_min = dep_cells[j];
-                    if (dep_cells[j] > local_max) local_max = dep_cells[j];
-                }
-
-                dep_current_zamb_local( spec->part[i].ix, di,
-                                      spec->part[i].x, dx,
-                                      qnx, qvy, qvz,
-                                      Jl, _ncell_total );
-
-                // Store results
-                spec -> part[i].x = x1;
-                spec -> part[i].ix += di;
-
-            }
-
-            // Store per-thread min/max in cache-line-aligned array
-            _minmax[tid].min = local_min;
-            _minmax[tid].max = local_max;
-
-            // Add thread-local energy into shared energy with atomic update
-            #pragma omp atomic
-            energy += local_energy;
-
-            // Merge thread-local current buffers into global current (only over active range)
-            #pragma omp single
-            {
-                int merge_lo = ncell;
-                int merge_hi = -1;
-                for (int t = 0; t < _nthreads; t++) {
-                    if (_minmax[t].min < merge_lo) merge_lo = _minmax[t].min;
-                    if (_minmax[t].max > merge_hi) merge_hi = _minmax[t].max;
-                }
-                // Clamp to valid range
-                if (merge_lo < 0) merge_lo = 0;
-                if (merge_hi >= ncell) merge_hi = ncell - 1;
-                
-                // Store in shared variables for all threads to read
-                _merge_lo = merge_lo;
-                _merge_hi = merge_hi;
-            }
-
-            // Implicit barrier ensures all threads see the updated _merge_lo and _merge_hi
-            
-            int merge_lo = _merge_lo;
-            int merge_hi = _merge_hi;
-
-            #pragma omp for schedule(static)
-            for (int c = merge_lo; c <= merge_hi; c++) {
-                float jx = 0.0f, jy = 0.0f, jz = 0.0f;
-                for (int t = 0; t < _nthreads; t++) {
-                    jcell_local_t *Jl = _J_local_buf + t * _ncell_total + _gc0;
-                    jx += Jl[c].x;
-                    jy += Jl[c].y;
-                    jz += Jl[c].z;
-                }
-                J[c].x = jx;
-                J[c].y = jy;
-                J[c].z = jz;
-            }
+            spec_advance_worker(spec, emf, current, &energy, tem, dt_dx, qnx, ncell);
         }
     } else {
-        // Already in a parallel region - execute particle push and merge
-        int tid = omp_get_thread_num();
-        int local_min = ncell;
-        int local_max = -1;
-
-        // Reset thread-local buffer for this timestep
-        memset( _J_local_buf + tid * _ncell_total, 0, _ncell_total * sizeof(jcell_local_t) );
-
-    // Advance particles with guided scheduling for load balancing
-    double local_energy = 0.0;
-    #pragma omp for schedule(guided)
-        for (int i=0; i<spec->np; i++) {
-
-            float3 Ep, Bp;
-            float utx, uty, utz;
-            float ux, uy, uz, u2;
-            float gamma, rg, gtem, otsq;
-
-            float x1;
-
-            int di;
-            float dx;
-
-            // Load particle momenta
-            ux = spec -> part[i].ux;
-            uy = spec -> part[i].uy;
-            uz = spec -> part[i].uz;
-
-            // interpolate fields
-            interpolate_fld( emf -> E_part, emf -> B_part, &spec -> part[i], &Ep, &Bp );
-            // Ep.x = Ep.y = Ep.z = Bp.x = Bp.y = Bp.z = 0;
-
-            // advance u using Boris scheme
-            Ep.x *= tem;
-            Ep.y *= tem;
-            Ep.z *= tem;
-
-            utx = ux + Ep.x;
-            uty = uy + Ep.y;
-            utz = uz + Ep.z;
-
-            // Perform first half of the rotation
-            // Get time centered gamma
-            u2 = utx*utx + uty*uty + utz*utz;
-            gamma = sqrtf( 1 + u2 );
-
-            // Accumulate time centered energy into thread-local accumulator
-            local_energy += u2 / ( 1 + gamma );
-
-            gtem = tem / gamma;
-
-            Bp.x *= gtem;
-            Bp.y *= gtem;
-            Bp.z *= gtem;
-
-            otsq = 2.0f / ( 1.0f + Bp.x*Bp.x + Bp.y*Bp.y + Bp.z*Bp.z );
-
-            ux = utx + uty*Bp.z - utz*Bp.y;
-            uy = uty + utz*Bp.x - utx*Bp.z;
-            uz = utz + utx*Bp.y - uty*Bp.x;
-
-            // Perform second half of the rotation
-
-            Bp.x *= otsq;
-            Bp.y *= otsq;
-            Bp.z *= otsq;
-
-            utx += uy*Bp.z - uz*Bp.y;
-            uty += uz*Bp.x - ux*Bp.z;
-            utz += ux*Bp.y - uy*Bp.x;
-
-            // Perform second half of electric field acceleration
-            ux = utx + Ep.x;
-            uy = uty + Ep.y;
-            uz = utz + Ep.z;
-
-            // Store new momenta
-            spec -> part[i].ux = ux;
-            spec -> part[i].uy = uy;
-            spec -> part[i].uz = uz;
-
-            // push particle
-            rg = 1.0f / sqrtf(1.0f + ux*ux + uy*uy + uz*uz);
-
-            dx = dt_dx * rg * ux;
-
-            x1 = spec -> part[i].x + dx;
-
-            di = ltrim(x1);
-
-            x1 -= di;
-
-            float qvy = spec->q * uy * rg;
-            float qvz = spec->q * uz * rg;
-
-            // deposit current using Zamb method with thread-local buffers
-            tid = omp_get_thread_num();
-            jcell_local_t *Jl = _J_local_buf + tid * _ncell_total + _gc0;
-
-            // Track min/max deposited cells for optimized merge
-            int dep_cells[4];
-            dep_cells[0] = spec->part[i].ix - 1;
-            dep_cells[1] = spec->part[i].ix;
-            dep_cells[2] = spec->part[i].ix + di;
-            dep_cells[3] = spec->part[i].ix + di + 1;
-
-            for (int j = 0; j < 4; j++) {
-                if (dep_cells[j] < local_min) local_min = dep_cells[j];
-                if (dep_cells[j] > local_max) local_max = dep_cells[j];
-            }
-
-            dep_current_zamb_local( spec->part[i].ix, di,
-                                  spec->part[i].x, dx,
-                                  qnx, qvy, qvz,
-                                  Jl, _ncell_total );
-
-            // Store results
-            spec -> part[i].x = x1;
-            spec -> part[i].ix += di;
-
-        }
-
-        // Store per-thread min/max in cache-line-aligned array
-        _minmax[tid].min = local_min;
-        _minmax[tid].max = local_max;
-
-    // Add thread-local energy into shared energy with atomic update
-    #pragma omp atomic
-    energy += local_energy;
-
-        // Merge thread-local current buffers into global current (only over active range)
-        #pragma omp single
-        {
-            int merge_lo = ncell;
-            int merge_hi = -1;
-            for (int t = 0; t < _nthreads; t++) {
-                if (_minmax[t].min < merge_lo) merge_lo = _minmax[t].min;
-                if (_minmax[t].max > merge_hi) merge_hi = _minmax[t].max;
-            }
-            // Clamp to valid range
-            if (merge_lo < 0) merge_lo = 0;
-            if (merge_hi >= ncell) merge_hi = ncell - 1;
-            
-            // Store in shared variables for all threads to read
-            _merge_lo = merge_lo;
-            _merge_hi = merge_hi;
-        }
-
-        // Implicit barrier ensures all threads see the updated _merge_lo and _merge_hi
-        
-        int merge_lo = _merge_lo;
-        int merge_hi = _merge_hi;
-
-        #pragma omp for schedule(static)
-        for (int c = merge_lo; c <= merge_hi; c++) {
-            float jx = 0.0f, jy = 0.0f, jz = 0.0f;
-            for (int t = 0; t < _nthreads; t++) {
-                jcell_local_t *Jl = _J_local_buf + t * _ncell_total + _gc0;
-                jx += Jl[c].x;
-                jy += Jl[c].y;
-                jz += Jl[c].z;
-            }
-            J[c].x = jx;
-            J[c].y = jy;
-            J[c].z = jz;
-        }
+        // Already in a parallel region - execute worker directly without creating new team
+        spec_advance_worker(spec, emf, current, &energy, tem, dt_dx, qnx, ncell);
     }
 
     // Note: J_local_buf is persistent across timesteps and freed at program cleanup
