@@ -933,8 +933,6 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
     double energy = 0;
 
     // Advance particles
-    // Parallelized loop: each particle computation is independent
-    #pragma omp parallel for collapse(1) reduction(+:energy)
     for (int i=0; i<spec->np; i++) {
 
         float3 Ep, Bp;
@@ -1025,8 +1023,6 @@ void spec_advance( t_species* spec, t_emf* emf, t_current* current )
         // 				 qnx, qvy, qvz,
         // 				 current );
 
-        // Current deposition with atomic operations for thread safety
-        #pragma omp critical(current_deposition)
         dep_current_zamb( spec -> part[i].ix, di,
                          spec -> part[i].x, dx,
                          qnx, qvy, qvz,
