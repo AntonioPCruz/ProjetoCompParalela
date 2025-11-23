@@ -101,6 +101,38 @@ void current_zero( t_current *current )
 }
 
 /**
+ * @brief Zeros all electric current density values in a local buffer
+ * 
+ * Used for thread-local current buffers during parallel particle advance.
+ * 
+ * @param c   Electric current density buffer
+ */
+void zero_current(t_current *c) {
+    for (int i = 0; i < c->nx+1; i++) {
+        c->J[i].x = 0.0f;
+        c->J[i].y = 0.0f;
+        c->J[i].z = 0.0f;
+    }
+}
+
+/**
+ * @brief Adds source current density to destination current density
+ * 
+ * Used to combine thread-local current buffers into the global buffer
+ * during parallel particle advance.
+ * 
+ * @param dst   Destination electric current density
+ * @param src   Source electric current density
+ */
+void add_current(t_current *dst, const t_current *src) {
+    for (int i = 0; i < dst->nx+1; i++) {
+        dst->J[i].x += src->J[i].x;
+        dst->J[i].y += src->J[i].y;
+        dst->J[i].z += src->J[i].z;
+    }
+}
+
+/**
  * @brief Updates guard cell values
  * 
  * When using periodic boundaries the electric current that was added to
