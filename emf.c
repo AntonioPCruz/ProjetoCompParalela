@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <string.h>
 #include <math.h>
+#include <omp.h>
 
 #include "emf.h"
 #include "zdf.h"
@@ -451,6 +452,7 @@ void yee_e( t_emf *emf, const t_current *current, const float dt )
     const int nx = emf->nx;
 
 	// Canonical implementation
+	#pragma omp parallel for
 	for (int i = 0; i <= nx+1; i++) {
 		E[i].x += (                                - dt * J[i].x );
 		E[i].y += ( - dt_dx * ( B[i].z - B[i-1].z) - dt * J[i].y );
