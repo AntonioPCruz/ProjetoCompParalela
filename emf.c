@@ -436,13 +436,13 @@ void yee_b( t_emf *emf, const float dt )
 }
 
 /**
- * @brief Advance Electric field using Yee scheme
+ * @brief Advance Electric field using Yee scheme (internal, non-parallel version)
  * 
  * @param emf 		EM fields
  * @param current 	Electric current density
  * @param dt 		Time step
  */
-void yee_e( t_emf *emf, const t_current *current, const float dt )
+void yee_e_impl( t_emf *emf, const t_current *current, const float dt )
 {
 	float dt_dx = dt / emf->dx;
 
@@ -451,14 +451,25 @@ void yee_e( t_emf *emf, const t_current *current, const float dt )
     const float3* const restrict J = current -> J;
     const int nx = emf->nx;
 
-	// Canonical implementation
-	#pragma omp parallel for schedule(dynamic)
+	// Canonical implementation - no pragma here, parallelized at caller level
+	#pragma omp for schedule(static)
 	for (int i = 0; i <= nx+1; i++) {
 		E[i].x += (                                - dt * J[i].x );
 		E[i].y += ( - dt_dx * ( B[i].z - B[i-1].z) - dt * J[i].y );
 		E[i].z += ( + dt_dx * ( B[i].y - B[i-1].y) - dt * J[i].z );
 	}
+}
 
+/**
+ * @brief Advance Electric field using Yee scheme
+ * 
+ * @param emf 		EM fields
+ * @param current 	Electric current density
+ * @param dt 		Time step
+ */
+void yee_e( t_emf *emf, const t_current *current, const float dt )
+{
+	yee_e_impl( emf, current, dt );
 }
 
 /**
@@ -555,6 +566,8 @@ void emf_advance( t_emf *emf, const t_current *current )
 	// Advance EM field using Yee algorithm modified for having E and B time centered
 	yee_b( emf, dt/2.0f );
 
+	// Single parallel region for yee_e to avoid multiple barriers
+	#pragma omp parallel
 	yee_e( emf, current, dt );
 
     // Process open boundaries if needed
