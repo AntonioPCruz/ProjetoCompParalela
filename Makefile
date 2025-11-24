@@ -4,7 +4,7 @@ CFLAGS = -O3 -Ofast -march=native -fopenmp -std=c99 -pedantic -Wall -Wextra -g
 #CFLAGS = -Kfast -std=c99 
 LDFLAGS = -lm
 
-export OMP_NUM_THREADS = 16
+export OMP_NUM_THREADS ?= 32
 
 #Debug options
 #CFLAGS = -g -Og -std=c99 -pedantic -fsanitize=undefined -fsanitize=address
