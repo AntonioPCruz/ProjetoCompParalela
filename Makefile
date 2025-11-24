@@ -1,6 +1,6 @@
 # GCC options
 CC = scorep gcc
-CFLAGS = -Ofast -g -std=c99 -pedantic -Wall -fopenmp -march=native -fno-omit-frame-pointer
+CFLAGS = -Ofast -g -std=c99 -Wall -fopenmp -march=native -fno-omit-frame-pointer
 LDFLAGS = -lm -fopenmp
 
 #Debug options
