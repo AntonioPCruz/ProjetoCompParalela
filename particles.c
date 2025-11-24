@@ -13,7 +13,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
-
+#include <omp.h>
 #include "particles.h"
 
 #include "random.h"
@@ -768,11 +768,15 @@ void dep_current_zamb( int ix0, int di,
 
         S1x[0] = 1.0f - vp[k].x1;
         S1x[1] = vp[k].x1;
-
+	#pragma omp atomic
         J[ vp[k].ix     ].x += qnx * vp[k].dx;
+	#pragma omp atomic
         J[ vp[k].ix     ].y += vp[k].qvy * (S0x[0]+S1x[0]+(S0x[0]-S1x[0])/2.0f);
+	#pragma omp atomic
         J[ vp[k].ix + 1 ].y += vp[k].qvy * (S0x[1]+S1x[1]+(S0x[1]-S1x[1])/2.0f);
+	#pragma omp atomic
         J[ vp[k].ix     ].z += vp[k].qvz * (S0x[0]+S1x[0]+(S0x[0]-S1x[0])/2.0f);
+	#pragma omp atomic
         J[ vp[k].ix  +1 ].z += vp[k].qvz * (S0x[1]+S1x[1]+(S0x[1]-S1x[1])/2.0f);
     }
 
@@ -916,179 +920,162 @@ int ltrim( float x )
  * @param emf       EM fields
  * @param current   Current density
  */
-void spec_advance(t_species* spec, t_emf* emf, t_current* current)
+void spec_advance( t_species* spec, t_emf* emf, t_current* current )
 {
-    uint64_t t0 = timer_ticks();
 
-    const float tem   = 0.5f * spec->dt / spec->m_q;
+    uint64_t t0;
+    t0 = timer_ticks();
+
+    const float tem   = 0.5 * spec->dt/spec -> m_q;
     const float dt_dx = spec->dt / spec->dx;
 
-    const float qnx = spec->q * spec->dx / spec->dt;
-    const int nx0   = spec->nx;
+    // Auxiliary values for current deposition
+    const float qnx = spec -> q *  spec->dx / spec->dt;
 
-    double energy_global = 0.0;
+    const int nx0 = spec -> nx;
 
-    // -------------------------------
-    // (1) Create thread-local current buffers
-    // -------------------------------
-    int nthreads = omp_get_max_threads();
+    double energy = 0;
+	
+    // Advance particles
+    #pragma omp parallel for reduction(+:energy) default(shared)
+    for (int i=0; i<spec->np; i++) {
 
-    t_current *local_currents = malloc(nthreads * sizeof(t_current));
+        float3 Ep, Bp;
+        float utx, uty, utz;
+        float ux, uy, uz, u2;
+        float gamma, rg, gtem, otsq;
 
-    for (int t = 0; t < nthreads; t++) {
-        local_currents[t].nx = current->nx;
-        local_currents[t].J  = malloc((current->nx + 1) * sizeof(float3));
-        zero_current(&local_currents[t]);
+        float x1;
+
+        int di;
+        float dx;
+
+        // Load particle momenta
+        ux = spec -> part[i].ux;
+        uy = spec -> part[i].uy;
+        uz = spec -> part[i].uz;
+
+        // interpolate fields
+        interpolate_fld( emf -> E_part, emf -> B_part, &spec -> part[i], &Ep, &Bp );
+        // Ep.x = Ep.y = Ep.z = Bp.x = Bp.y = Bp.z = 0;
+
+        // advance u using Boris scheme
+        Ep.x *= tem;
+        Ep.y *= tem;
+        Ep.z *= tem;
+
+        utx = ux + Ep.x;
+        uty = uy + Ep.y;
+        utz = uz + Ep.z;
+
+        // Perform first half of the rotation
+        // Get time centered gamma
+        u2 = utx*utx + uty*uty + utz*utz;
+        gamma = sqrtf( 1 + u2 );
+
+        // Accumulate time centered energy
+        energy += u2 / ( 1 + gamma );
+
+        gtem = tem / gamma;
+
+        Bp.x *= gtem;
+        Bp.y *= gtem;
+        Bp.z *= gtem;
+
+        otsq = 2.0f / ( 1.0f + Bp.x*Bp.x + Bp.y*Bp.y + Bp.z*Bp.z );
+
+        ux = utx + uty*Bp.z - utz*Bp.y;
+        uy = uty + utz*Bp.x - utx*Bp.z;
+        uz = utz + utx*Bp.y - uty*Bp.x;
+
+        // Perform second half of the rotation
+
+        Bp.x *= otsq;
+        Bp.y *= otsq;
+        Bp.z *= otsq;
+
+        utx += uy*Bp.z - uz*Bp.y;
+        uty += uz*Bp.x - ux*Bp.z;
+        utz += ux*Bp.y - uy*Bp.x;
+
+        // Perform second half of electric field acceleration
+        ux = utx + Ep.x;
+        uy = uty + Ep.y;
+        uz = utz + Ep.z;
+
+        // Store new momenta
+        spec -> part[i].ux = ux;
+        spec -> part[i].uy = uy;
+        spec -> part[i].uz = uz;
+
+        // push particle
+        rg = 1.0f / sqrtf(1.0f + ux*ux + uy*uy + uz*uz);
+
+        dx = dt_dx * rg * ux;
+
+        x1 = spec -> part[i].x + dx;
+
+        di = ltrim(x1);
+
+        x1 -= di;
+
+        float qvy = spec->q * uy * rg;
+        float qvz = spec->q * uz * rg;
+
+        // deposit current using Eskirepov method
+        // dep_current_esk( spec -> part[i].ix, di,
+        // 				 spec -> part[i].x, x1,
+        // 				 qnx, qvy, qvz,
+        // 				 current );
+
+        dep_current_zamb( spec -> part[i].ix, di,
+                         spec -> part[i].x, dx,
+                         qnx, qvy, qvz,
+                         current );
+
+        // Store results
+        spec -> part[i].x = x1;
+        spec -> part[i].ix += di;
+
     }
 
-    // -------------------------------
-    // (2) Parallel particle advance
-    // -------------------------------
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        t_current *lc = &local_currents[tid];
+    // Store energy
+    spec -> energy = spec-> q * spec -> m_q * energy * spec -> dx;
 
-        double energy_private = 0.0;
+    // Advance internal iteration number
+    spec -> iter += 1;
 
-        #pragma omp for nowait
-        for (int i = 0; i < spec->np; i++) {
+    // Check for particles leaving the box
+    if ( spec -> moving_window || spec -> bc_type == PART_BC_OPEN ){
 
-            float3 Ep, Bp;
-            float utx, uty, utz;
-            float ux, uy, uz, u2;
-            float gamma, rg, gtem, otsq;
-            float x1;
-            int di;
-            float dx;
+        // Move simulation window if needed
+        if (spec -> moving_window )	spec_move_window( spec );
 
-            // Load particle momenta
-            ux = spec->part[i].ux;
-            uy = spec->part[i].uy;
-            uz = spec->part[i].uz;
-
-            // interpolate fields
-            interpolate_fld(emf->E_part, emf->B_part, &spec->part[i], &Ep, &Bp);
-
-            // advance u using Boris scheme
-            Ep.x *= tem;
-            Ep.y *= tem;
-            Ep.z *= tem;
-
-            utx = ux + Ep.x;
-            uty = uy + Ep.y;
-            utz = uz + Ep.z;
-
-            // First half rotation
-            u2 = utx*utx + uty*uty + utz*utz;
-            gamma = sqrtf(1.0f + u2);
-
-            energy_private += u2 / (1.0f + gamma);
-
-            gtem = tem / gamma;
-
-            Bp.x *= gtem;
-            Bp.y *= gtem;
-            Bp.z *= gtem;
-
-            otsq = 2.0f / (1.0f + Bp.x*Bp.x + Bp.y*Bp.y + Bp.z*Bp.z);
-
-            ux = utx + uty*Bp.z - utz*Bp.y;
-            uy = uty + utz*Bp.x - utx*Bp.z;
-            uz = utz + utx*Bp.y - uty*Bp.x;
-
-            // second half of rotation
-            Bp.x *= otsq;
-            Bp.y *= otsq;
-            Bp.z *= otsq;
-
-            utx += uy*Bp.z - uz*Bp.y;
-            uty += uz*Bp.x - ux*Bp.z;
-            utz += ux*Bp.y - uy*Bp.x;
-
-            // second half electric field acceleration
-            ux = utx + Ep.x;
-            uy = uty + Ep.y;
-            uz = utz + Ep.z;
-
-            // Store new momenta
-            spec->part[i].ux = ux;
-            spec->part[i].uy = uy;
-            spec->part[i].uz = uz;
-
-            // push particle
-            rg = 1.0f / sqrtf(1.0f + ux*ux + uy*uy + uz*uz);
-
-            dx = dt_dx * rg * ux;
-            x1 = spec->part[i].x + dx;
-
-            di = ltrim(x1);
-            x1 -= di;
-
-            float qvy = spec->q * uy * rg;
-            float qvz = spec->q * uz * rg;
-
-            // deposit current into thread-local buffer
-            dep_current_zamb(spec->part[i].ix, di,
-                             spec->part[i].x, dx,
-                             qnx, qvy, qvz,
-                             lc);
-
-            // store new position
-            spec->part[i].x  = x1;
-            spec->part[i].ix += di;
-        }
-
-        // Thread-local energy reduction
-        #pragma omp atomic
-        energy_global += energy_private;
-    }
-
-    // -------------------------------
-    // (3) Combine local currents into global current
-    // -------------------------------
-    for (int t = 0; t < nthreads; t++) {
-        add_current(current, &local_currents[t]);
-        free(local_currents[t].J);
-    }
-    free(local_currents);
-
-    // -------------------------------
-    // (4) Remaining original logic
-    // -------------------------------
-    spec->energy = spec->q * spec->m_q * energy_global * spec->dx;
-    spec->iter += 1;
-
-    // boundaries
-    if (spec->moving_window || spec->bc_type == PART_BC_OPEN) {
-
-        if (spec->moving_window)
-            spec_move_window(spec);
-
+        // Use absorbing boundaries along x
         int i = 0;
-        while (i < spec->np) {
-            if (spec->part[i].ix < 0 || spec->part[i].ix >= nx0) {
-                spec->part[i] = spec->part[--spec->np];
+        while ( i < spec -> np ) {
+            if (( spec -> part[i].ix < 0 ) || ( spec -> part[i].ix >= nx0 )) {
+                spec -> part[i] = spec -> part[ -- spec -> np ];
                 continue;
             }
             i++;
         }
 
     } else {
-        for (int i = 0; i < spec->np; i++) {
-            spec->part[i].ix += ((spec->part[i].ix < 0) ? nx0 : 0)
-                              - ((spec->part[i].ix >= nx0) ? nx0 : 0);
+        // Use periodic boundaries in x
+        for (int i=0; i<spec->np; i++) {
+            spec -> part[i].ix += (( spec -> part[i].ix < 0 ) ? nx0 : 0 ) - (( spec -> part[i].ix >= nx0 ) ? nx0 : 0);
         }
     }
 
-    // sorting
-    if (spec->n_sort > 0) {
-        if (!(spec->iter % spec->n_sort))
-            spec_sort(spec);
+    // Sort species at every n_sort time steps
+    if ( spec -> n_sort > 0 ) {
+        if ( ! (spec -> iter % spec -> n_sort) ) spec_sort( spec );
     }
 
-    _spec_npush += spec->np;
-    _spec_time  += timer_interval_seconds(t0, timer_ticks());
+    // Timing info
+    _spec_npush += spec -> np;
+    _spec_time += timer_interval_seconds( t0, timer_ticks() );
 }
 
 /*********************************************************************************************

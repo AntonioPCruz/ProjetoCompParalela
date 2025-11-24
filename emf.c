@@ -14,7 +14,7 @@
 #include <assert.h>
 #include <string.h>
 #include <math.h>
-
+#include <omp.h>
 #include "emf.h"
 #include "zdf.h"
 #include "timer.h"
@@ -427,7 +427,7 @@ void yee_b( t_emf *emf, const float dt )
 	float dt_dx = dt / emf->dx;
 
 	// Canonical implementation
-	#pragma omp simd
+	#pragma omp parallel for 
 	for (int i=-1; i<=emf->nx; i++) {
 		// B[ i ].x += 0;  // Bx does not evolve in 1D
 		B[ i ].y += (   dt_dx * ( E[i+1].z - E[ i ].z) );
@@ -452,8 +452,8 @@ void yee_e( t_emf *emf, const t_current *current, const float dt )
     const int nx = emf->nx;
 
 	// Canonical implementation
-	#pragma omp simd
-	for (int i = 0; i <= nx+1; i++) {
+        #pragma omp parallel for		
+        for (int i = 0; i <= nx+1; i++) {
 		E[i].x += (                                - dt * J[i].x );
 		E[i].y += ( - dt_dx * ( B[i].z - B[i-1].z) - dt * J[i].y );
 		E[i].z += ( + dt_dx * ( B[i].y - B[i-1].y) - dt * J[i].z );
@@ -553,14 +553,18 @@ void emf_advance( t_emf *emf, const t_current *current )
 	const float dt = emf->dt;
 
 	// Advance EM field using Yee algorithm modified for having E and B time centered
-	yee_b( emf, dt/2.0f );
+        
+		
+	  yee_b( emf, dt/2.0f );
 
-	yee_e( emf, current, dt );
+	  yee_e( emf, current, dt );
+	
 
     // Process open boundaries if needed
     if ( emf->bc_type == EMF_BC_OPEN ) mur_abc( emf );
 
-	yee_b( emf, dt/2.0f );
+	
+    	yee_b( emf, dt/2.0f );
 
 	// Update guard cells
 	emf_update_gc( emf );
@@ -700,6 +704,7 @@ void emf_update_part_fld( t_emf* const emf ) {
     switch (emf->ext_fld.E_type)
     {
     case EMF_FLD_TYPE_UNIFORM: {
+
         for (int i=-emf->gc[0]; i<emf->nx+emf->gc[1]; i++) {
             float3 e = emf -> E[i];
             e.x += emf->ext_fld.E_0.x;
@@ -709,6 +714,7 @@ void emf_update_part_fld( t_emf* const emf ) {
         }
         break; }
     case EMF_FLD_TYPE_CUSTOM: {
+				      
         for (int i=-emf->gc[0]; i<emf->nx+emf->gc[1]; i++) {
             float3 ext_E = (*emf->ext_fld.E_custom)(i,emf->dx,emf->ext_fld.E_custom_data);
 

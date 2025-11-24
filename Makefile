@@ -1,7 +1,10 @@
 # GCC options
-CC = scorep gcc
-CFLAGS = -Ofast -g -std=c99 -Wall -fopenmp -march=native -fno-omit-frame-pointer
-LDFLAGS = -lm -fopenmp
+CC = gcc
+CFLAGS = -O3 -Ofast -march=native -fopenmp -std=c99 -pedantic -Wall -Wextra -g
+#CFLAGS = -Kfast -std=c99 
+LDFLAGS = -lm
+
+export OMP_NUM_THREADS = 16
 
 #Debug options
 #CFLAGS = -g -Og -std=c99 -pedantic -fsanitize=undefined -fsanitize=address
@@ -32,7 +35,7 @@ all : $(SOURCE) $(TARGET)
 docs : $(DOCS)
 
 $(TARGET) : $(OBJ)
-	$(CC) $(CFLAGS) $(OBJ) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $(OBJ) $(LDFLAGS) -o $(TARGET)
 
 .c.o:
 	$(CC) -c $(CFLAGS) $< -o $@
@@ -44,3 +47,7 @@ clean:
 	@touch $(TARGET) $(OBJ)
 	rm -f $(TARGET) $(OBJ)
 	rm -rf $(DOCSBASE)
+
+run: $(TARGET)
+	@echo "A correr com OMP_NUM_THREADS=$(OMP_NUM_THREADS)"
+	./$(TARGET)

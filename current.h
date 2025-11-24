@@ -93,26 +93,6 @@ void current_delete( t_current *current );
 void current_zero( t_current *current );
 
 /**
- * @brief Zeros all electric current density values in a local buffer
- * 
- * Used for thread-local current buffers during parallel particle advance.
- * 
- * @param c   Electric current density buffer
- */
-void zero_current(t_current *c);
-
-/**
- * @brief Adds source current density to destination current density
- * 
- * Used to combine thread-local current buffers into the global buffer
- * during parallel particle advance.
- * 
- * @param dst   Destination electric current density
- * @param src   Source electric current density
- */
-void add_current(t_current *dst, const t_current *src);
-
-/**
  * @brief Advances electric current density 1 time step
  * 
  * @param current Electric current density object

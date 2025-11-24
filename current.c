@@ -101,38 +101,6 @@ void current_zero( t_current *current )
 }
 
 /**
- * @brief Zeros all electric current density values in a local buffer
- * 
- * Used for thread-local current buffers during parallel particle advance.
- * 
- * @param c   Electric current density buffer
- */
-void zero_current(t_current *c) {
-    for (int i = 0; i < c->nx+1; i++) {
-        c->J[i].x = 0.0f;
-        c->J[i].y = 0.0f;
-        c->J[i].z = 0.0f;
-    }
-}
-
-/**
- * @brief Adds source current density to destination current density
- * 
- * Used to combine thread-local current buffers into the global buffer
- * during parallel particle advance.
- * 
- * @param dst   Destination electric current density
- * @param src   Source electric current density
- */
-void add_current(t_current *dst, const t_current *src) {
-    for (int i = 0; i < dst->nx+1; i++) {
-        dst->J[i].x += src->J[i].x;
-        dst->J[i].y += src->J[i].y;
-        dst->J[i].z += src->J[i].z;
-    }
-}
-
-/**
  * @brief Updates guard cell values
  * 
  * When using periodic boundaries the electric current that was added to
@@ -294,41 +262,56 @@ void get_smooth_comp( int n, float* sa, float* sb) {
  * @param sa kernel a value
  * @param sb kernel b value
  */
-void kernel_x( t_current* const current, const float sa, const float sb ){
+void kernel_x( t_current* const current, const float sa, const float sb )
+{
+    const int nx  = current->nx;
+    const int gc0 = current->gc[0];
+    const int gc1 = current->gc[1];
+    const int total = gc0 + nx + gc1;
 
-    float3* restrict const J = current -> J;
+    float3* restrict J = current->J;      // J[-gc0 .. nx-1+gc1]
 
-    float3 fl = J[-1];
-    float3 f0 = J[ 0];
+    // Alocar buffer temporário
+    float3* restrict tmp = malloc( total * sizeof(float3) );
+    if (!tmp) return;
 
-    for( int i = 0; i < current -> nx; i++) {
+    // Copiar toda a estrutura linear J (ghost + interior)
+    memcpy(tmp, J - gc0, total * sizeof(float3));
 
-        float3 fu = J[i + 1];
+    // Loop principal: cada célula 0..nx-1 é independente
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nx; i++) {
+
+        // índice correspondente em tmp
+        int idx = gc0 + i;
+
+        float3 fl = tmp[idx - 1];
+        float3 f0 = tmp[idx];
+        float3 fu = tmp[idx + 1];
 
         float3 fs;
-
         fs.x = sa * fl.x + sb * f0.x + sa * fu.x;
         fs.y = sa * fl.y + sb * f0.y + sa * fu.y;
         fs.z = sa * fl.z + sb * f0.z + sa * fu.z;
 
         J[i] = fs;
-
-        fl = f0;
-        f0 = fu;
-
     }
 
-    // Update x boundaries for periodic boundaries
-    if ( current -> bc_type == CURRENT_BC_PERIODIC ) {
-        for(int i = -current->gc[0]; i<0; i++)
-            J[ i ] = J[ current->nx + i ];
+    free(tmp);
 
-        for (int i=0; i<current->gc[1]; i++)
-            J[ current->nx + i ] = J[ i ];
+    // Repor guard cells (periodic)
+    if ( current->bc_type == CURRENT_BC_PERIODIC ) {
+
+        // lower ghost cells
+        for (int i = -gc0; i < 0; i++)
+            J[i] = J[nx + i];
+
+        // upper ghost cells
+        for (int i = 0; i < gc1; i++)
+            J[nx + i] = J[i];
     }
-
-
 }
+
 
 /**
  * @brief Applies digital filtering to the current density
